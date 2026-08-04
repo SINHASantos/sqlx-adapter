@@ -1,0 +1,108 @@
+name: Release
+
+# Releases are NOT automatic. A release manager pushes a git tag manually:
+#   * v1.4.0-rc1  -> publishes a GitHub *pre-release* only (artifact for the Apache vote)
+#   * v1.4.0      -> publishes a GitHub *release* and pushes the crate to crates.io
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Manual Tag Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Resolve Tag
+        id: tag
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+
+          if [[ "$VERSION" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-[Rr][Cc]([0-9]+)$ ]]; then
+            BASE_VERSION="${BASH_REMATCH[1]}"
+            RC_NUMBER="${BASH_REMATCH[2]}"
+            IS_RC=true
+          elif [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            BASE_VERSION="$VERSION"
+            RC_NUMBER=""
+            IS_RC=false
+          else
+            echo "::error::Tag '$TAG' is not a supported release tag (expected vX.Y.Z or vX.Y.Z-rcN)."
+            exit 1
+          fi
+
+          CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [[ "$CARGO_VERSION" != "$BASE_VERSION" ]]; then
+            echo "::error::Cargo.toml version ($CARGO_VERSION) does not match tag version ($BASE_VERSION). Bump Cargo.toml before tagging."
+            exit 1
+          fi
+
+          # Apache source release artifact naming. The RC number is intentionally
+          # NOT part of the file name, so the bits that get voted on are byte
+          # identical to the bits published for the final release.
+          ARTIFACT="apache-casbin-sqlx-adapter-${BASE_VERSION}-incubating-src.tar.gz"
+
+          {
+            echo "tag=$TAG"
+            echo "base_version=$BASE_VERSION"
+            echo "rc_number=$RC_NUMBER"
+            echo "is_rc=$IS_RC"
+            echo "artifact=$ARTIFACT"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build Apache Source Package
+        run: |
+          set -euo pipefail
+          ARTIFACT="${{ steps.tag.outputs.artifact }}"
+          # The tarball unpacks into a single top level directory named after the
+          # artifact, and contains sources only - no binaries, no VCS metadata.
+          git archive --format=tar.gz \
+            --prefix="${ARTIFACT%.tar.gz}/" \
+            -o "$ARTIFACT" HEAD
+          sha512sum "$ARTIFACT" > "$ARTIFACT.sha512"
+
+      - name: Publish GitHub Pre-Release
+        if: steps.tag.outputs.is_rc == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ARTIFACT="${{ steps.tag.outputs.artifact }}"
+          gh release create "${{ steps.tag.outputs.tag }}" \
+            --title "v${{ steps.tag.outputs.base_version }}-rc${{ steps.tag.outputs.rc_number }}" \
+            --prerelease \
+            --notes "Release candidate ${{ steps.tag.outputs.rc_number }} for version ${{ steps.tag.outputs.base_version }}. This is not an official release; it is the source package for the Apache vote. Release managers should download \`$ARTIFACT\`, sign it locally, and use it for the vote." \
+            "$ARTIFACT" "$ARTIFACT.sha512"
+
+      - name: Publish GitHub Release
+        if: steps.tag.outputs.is_rc == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ARTIFACT="${{ steps.tag.outputs.artifact }}"
+          gh release create "${{ steps.tag.outputs.tag }}" \
+            --title "v${{ steps.tag.outputs.base_version }}" \
+            --notes "Version ${{ steps.tag.outputs.base_version }}. The official source package is \`$ARTIFACT\`." \
+            "$ARTIFACT" "$ARTIFACT.sha512"
+
+      - name: Install Rust toolchain
+        if: steps.tag.outputs.is_rc == 'false'
+        run: |
+          rustup update stable
+          rustup default stable
+
+      - name: Publish To crates.io
+        if: steps.tag.outputs.is_rc == 'false'
+        env:
+          SQLX_OFFLINE: true
+        run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
